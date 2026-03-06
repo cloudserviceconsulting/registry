@@ -1,0 +1,16 @@
+{
+  "protocols": ["6.0"],
+  "os": "darwin",
+  "arch": "arm64",
+  "filename": "terraform-provider-jira_0.1.0_darwin_arm64.zip",
+  "download_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.1.0/terraform-provider-jira_0.1.0_darwin_arm64.zip",
+  "shasum": "REPLACE_WITH_ACTUAL_SHA256",
+  "signing_keys": {
+    "gpg_public_keys": [
+      {
+        "key_id": "REPLACE_WITH_GPG_FINGERPRINT",
+        "ascii_armor": "REPLACE_WITH_GPG_PUBLIC_KEY"
+      }
+    ]
+  }
+}
