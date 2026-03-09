@@ -6,7 +6,7 @@
   "arch": "arm64",
   "filename": "terraform-provider-jira_0.1.0_linux_arm64.zip",
   "download_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.1.0/terraform-provider-jira_0.1.0_linux_arm64.zip",
-  "shasum": "e298a810677b768cf55d6e528e9ad6e34c728a80e76b7978c752eea68e1bfaff",
+  "shasum": "96fe9b6264eb8d86ca67e7ab62c3118b56f46602151ed6230d3d07127c0f8777",
   "signing_keys": {
     "gpg_public_keys": [
       {
