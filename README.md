@@ -1,6 +1,6 @@
 # Terraform Custom Provider Registry
 
-Static registry served via GitHub Pages at `cloudserviceconsulting.github.io/terraform-registry`.
+Static registry served via GitHub Pages at `terraform.registry.mwithinkupc.com`.
 
 ## Setup
 
@@ -19,7 +19,7 @@ In any Terraform configuration:
 terraform {
   required_providers {
     jira = {
-      source  = "cloudserviceconsulting.github.io/terraform-registry/csc/jira"
+      source  = "terraform.registry.mwithinkupc.com/csc/jira"
       version = "0.1.0"
     }
   }
@@ -45,5 +45,5 @@ Create a new directory tree under `v1/providers/csc/<provider-name>/` following 
 structure as `jira/`. Add the provider to any Terraform config with:
 
 ```hcl
-source = "cloudserviceconsulting.github.io/terraform-registry/csc/<provider-name>"
+source = "terraform.registry.mwithinkupc.com/csc/<provider-name>"
 ```
