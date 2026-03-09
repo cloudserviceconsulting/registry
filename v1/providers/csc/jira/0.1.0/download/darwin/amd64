@@ -6,6 +6,8 @@
   "arch": "amd64",
   "filename": "terraform-provider-jira_0.1.0_darwin_amd64.zip",
   "download_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.1.0/terraform-provider-jira_0.1.0_darwin_amd64.zip",
+  "shasums_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.1.0/terraform-provider-jira_0.1.0_SHA256SUMS",
+  "shasums_signature_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.1.0/terraform-provider-jira_0.1.0_SHA256SUMS.sig",
   "shasum": "2b8751f78eb28de57fbd32f68cdf65ccd610fe3f9c69bfcb50e0f74f49c7ad90",
   "signing_keys": {
     "gpg_public_keys": [
