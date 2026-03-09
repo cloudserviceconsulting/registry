@@ -6,7 +6,7 @@
   "arch": "amd64",
   "filename": "terraform-provider-jira_0.1.0_darwin_amd64.zip",
   "download_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.1.0/terraform-provider-jira_0.1.0_darwin_amd64.zip",
-  "shasum": "4ddb5d472566ebb20e095ae1c5f8c3e7564acd880d0aabe9d94c11ad6ae4cb92",
+  "shasum": "2b8751f78eb28de57fbd32f68cdf65ccd610fe3f9c69bfcb50e0f74f49c7ad90",
   "signing_keys": {
     "gpg_public_keys": [
       {
