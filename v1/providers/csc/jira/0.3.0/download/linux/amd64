@@ -8,7 +8,7 @@
   "download_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.3.0/terraform-provider-jira_0.3.0_linux_amd64.zip",
   "shasums_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.3.0/terraform-provider-jira_0.3.0_SHA256SUMS",
   "shasums_signature_url": "https://github.com/cloudserviceconsulting/terraform-provider-jira-assets/releases/download/v0.3.0/terraform-provider-jira_0.3.0_SHA256SUMS.sig",
-  "shasum": "e57662d39fdacf4873559b0eea866a857db4ed191d51c8ba708b65eb3ba5e56e",
+  "shasum": "d8b478785b7e2cf551197c43e40bdd93eae5dcb333f37f6f498bd7623089c4f2",
   "signing_keys": {
     "gpg_public_keys": [
       {
