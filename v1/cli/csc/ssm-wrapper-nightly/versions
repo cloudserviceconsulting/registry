@@ -1,0 +1,13 @@
+{
+  "versions": [
+    {
+      "version": "nightly-20260414-e94b664",
+      "platforms": [
+        {
+          "os": "universal",
+          "arch": "universal"
+        }
+      ]
+    }
+  ]
+}
