@@ -6,7 +6,7 @@
   "download_url": "https://github.com/cloudserviceconsulting/registry/releases/download/ssm_nightly_20260419_f8845b4/ssm-wrapper_nightly-20260419-f8845b4_universal.zip",
   "shasums_url": "https://github.com/cloudserviceconsulting/registry/releases/download/ssm_nightly_20260419_f8845b4/ssm-wrapper_nightly-20260419-f8845b4_SHA256SUMS",
   "shasums_signature_url": "https://github.com/cloudserviceconsulting/registry/releases/download/ssm_nightly_20260419_f8845b4/ssm-wrapper_nightly-20260419-f8845b4_SHA256SUMS.sig",
-  "shasum": "0e1294f41cef5b2deb4c52ef3831bb44869e98230f955192e8761ce0a3487643",
+  "shasum": "ab1926591ced370bc83737a66aaf41e98720ca4e73c9607a441c0d30f9c2ac94",
   "signing_keys": {
     "gpg_public_keys": [
       {
