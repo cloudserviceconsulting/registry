@@ -8,6 +8,15 @@
           "arch": "universal"
         }
       ]
+    },
+    {
+      "version": "4.0.1",
+      "platforms": [
+        {
+          "os": "universal",
+          "arch": "universal"
+        }
+      ]
     }
   ]
 }
