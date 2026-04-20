@@ -6,7 +6,7 @@
   "download_url": "https://github.com/cloudserviceconsulting/registry/releases/download/ssm_v4.0.1/ssm-wrapper_4.0.1_universal.zip",
   "shasums_url": "https://github.com/cloudserviceconsulting/registry/releases/download/ssm_v4.0.1/ssm-wrapper_4.0.1_SHA256SUMS",
   "shasums_signature_url": "https://github.com/cloudserviceconsulting/registry/releases/download/ssm_v4.0.1/ssm-wrapper_4.0.1_SHA256SUMS.sig",
-  "shasum": "092aea8d87dafa676da1db6b38fe43d128b5ed82176bfc2c8762a436a07927e0",
+  "shasum": "3e4809ef1306b4bc021b04975c11ffd7f147c5e4323205b3d8d5cc5d19577828",
   "signing_keys": {
     "gpg_public_keys": [
       {
