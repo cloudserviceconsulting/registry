@@ -5,10 +5,10 @@
   "os": "darwin",
   "arch": "arm64",
   "filename": "terraform-provider-jira_0.3.0_darwin_arm64.zip",
-  "download_url": "https://github.com/cloudserviceconsulting/terraform-registry/releases/download/v0.3.0/terraform-provider-jira_0.3.0_darwin_arm64.zip",
-  "shasums_url": "https://github.com/cloudserviceconsulting/terraform-registry/releases/download/v0.3.0/terraform-provider-jira_0.3.0_SHA256SUMS",
-  "shasums_signature_url": "https://github.com/cloudserviceconsulting/terraform-registry/releases/download/v0.3.0/terraform-provider-jira_0.3.0_SHA256SUMS.sig",
-  "shasum": "bbe66d819b4c5e62a52660e007dc948e02b016563762afb2800a877a738d32b2",
+  "download_url": "https://github.com/cloudserviceconsulting/registry/releases/download/v0.3.0/terraform-provider-jira_0.3.0_darwin_arm64.zip",
+  "shasums_url": "https://github.com/cloudserviceconsulting/registry/releases/download/v0.3.0/terraform-provider-jira_0.3.0_SHA256SUMS",
+  "shasums_signature_url": "https://github.com/cloudserviceconsulting/registry/releases/download/v0.3.0/terraform-provider-jira_0.3.0_SHA256SUMS.sig",
+  "shasum": "31d14b05308f41cb2077a198c0bbd3fb9b7337147867c2883665044c7d418d79",
   "signing_keys": {
     "gpg_public_keys": [
       {
