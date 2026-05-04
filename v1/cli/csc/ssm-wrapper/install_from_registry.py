@@ -13,7 +13,9 @@ the post-install release-notes prompt (reads ``CHANGELOG.md`` from the extracted
 bundle; same opt-out as the CLI used: ``SSM_SKIP_CHANGELOG_PROMPT=1``).
 
 Optional ``--channel stable|nightly`` overrides ``config.json`` for this run
-(useful for ``curl … | python3 -`` bootstrap installs).
+(useful for ``curl … | python3 -`` bootstrap installs). In that mode ``sys.stdin``
+is the script pipe, not the terminal; interactive ``sudo`` still uses the
+controlling TTY via ``/dev/tty`` when available.
 
 This script is stdlib-only (no ``libs`` imports): release-notes parsing mirrors
 ``libs/core/changelog_preview.py`` so it runs under plain ``python3``.
@@ -33,7 +35,7 @@ import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 # Keep in sync with libs/core/meta.py and libs/config/registry_urls.py
 REGISTRY_RAW_BASE_STABLE = (
@@ -47,6 +49,39 @@ REGISTRY_RAW_BASE_NIGHTLY = (
 
 # Makefile reads this to redirect pip / PyInstaller (see Makefile ``_Q``).
 _INSTALL_QUIET_ENV = "INSTALL_FROM_REGISTRY_QUIET"
+
+
+def _controlling_tty_available() -> bool:
+    """Return True if this session has a readable controlling terminal (``/dev/tty``)."""
+    try:
+        f = open("/dev/tty", "r")
+    except OSError:
+        return False
+    else:
+        f.close()
+        return True
+
+
+def _open_controlling_tty_stdin() -> Optional[TextIO]:
+    """
+    Open the controlling terminal for reading (e.g. ``sudo`` password prompts).
+
+    When the script is run as ``curl … | python3 -``, standard input is the
+    consumed download pipe, not an interactive TTY.
+    """
+    try:
+        return open("/dev/tty", "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _can_prompt_privileged_commands() -> bool:
+    """True if ``sudo`` may be able to read a password (root, stdin TTY, or ``/dev/tty``)."""
+    if os.geteuid() == 0:
+        return True
+    if sys.stdin.isatty():
+        return True
+    return _controlling_tty_available()
 
 
 def _changelog_skip_prompt() -> bool:
@@ -191,14 +226,13 @@ def _print_release_notes(title: str, lines: List[str]) -> None:
 
 def _maybe_prompt_release_notes(bundle_root: Path, release_label: str) -> None:
     """
-    On a TTY, offer to print the Keep a Changelog section for *release_label*.
+    Offer to print the Keep a Changelog section for *release_label*.
 
     Reads ``CHANGELOG.md`` from the extracted bundle tree (the version that was
-    just built and installed).
+    just built and installed). Uses ``/dev/tty`` when ``sys.stdin`` is not a TTY
+    (e.g. ``curl … | python3 -``).
     """
     if _changelog_skip_prompt():
-        return
-    if not sys.stdin.isatty():
         return
     rel = release_label.strip()
     if not rel:
@@ -217,13 +251,29 @@ def _maybe_prompt_release_notes(bundle_root: Path, release_label: str) -> None:
     lines = _preview_lines(plain)
     if not lines:
         return
+
+    tty_in: Optional[TextIO] = None
+    if sys.stdin.isatty():
+        read_fn = None
+    else:
+        tty_in = _open_controlling_tty_stdin()
+        if tty_in is None:
+            return
+        read_fn = tty_in
+
+    prompt = "Show release notes for this version in the terminal? (y/N) "
     try:
-        ans = input(
-            "Show release notes for this version in the terminal? (y/N) ",
-        ).strip().lower()
+        if read_fn is None:
+            ans = input(prompt).strip().lower()
+        else:
+            print(prompt, end="", flush=True)
+            ans = read_fn.readline().strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return
+    finally:
+        if tty_in is not None:
+            tty_in.close()
     if ans != "y":
         return
     _print_release_notes(f"Changelog — [{rel}]", lines)
@@ -403,16 +453,32 @@ def _run_with_optional_tty(argv: List[str], *, cwd: str) -> None:
                     env=env,
                 )
         elif sudoish:
-            proc = subprocess.run(
-                argv,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=3600,
-                check=False,
-                env=env,
-            )
+            tty_in = _open_controlling_tty_stdin()
+            if tty_in is None:
+                proc = subprocess.run(
+                    argv,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
+                    check=False,
+                    env=env,
+                )
+            else:
+                try:
+                    proc = subprocess.run(
+                        argv,
+                        cwd=cwd,
+                        stdin=tty_in,
+                        stdout=None,
+                        stderr=None,
+                        timeout=3600,
+                        check=False,
+                        env=env,
+                    )
+                finally:
+                    tty_in.close()
         else:
             proc = subprocess.run(
                 argv,
@@ -474,15 +540,30 @@ def _run_make_install_internal_returncode(bundle_root: Path) -> int:
                     env=env,
                 )
         elif os.geteuid() != 0:
-            proc = subprocess.run(
-                argv,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=3600,
-                env=env,
-            )
+            tty_in = _open_controlling_tty_stdin()
+            if tty_in is None:
+                proc = subprocess.run(
+                    argv,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
+                    env=env,
+                )
+            else:
+                try:
+                    proc = subprocess.run(
+                        argv,
+                        cwd=cwd,
+                        stdin=tty_in,
+                        stdout=None,
+                        stderr=None,
+                        timeout=3600,
+                        env=env,
+                    )
+                finally:
+                    tty_in.close()
         else:
             proc = subprocess.run(
                 argv,
@@ -601,10 +682,12 @@ def _install_from_zip(
 
 
 def _full_registry_install(*, channel_override: Optional[str] = None) -> None:
-    if not sys.stdin.isatty() and os.geteuid() != 0:
+    if not _can_prompt_privileged_commands():
         _die(
             "A terminal is required for sudo password prompts. "
-            "Run in a real TTY, use `sudo -v` first, or configure passwordless sudo.",
+            "Use an interactive shell (or save the script and run "
+            "`python3 install_from_registry.py`), run `sudo -v` first, "
+            "or configure passwordless sudo.",
         )
     channel = _resolve_install_channel(channel_override)
     base = _registry_base(channel)
