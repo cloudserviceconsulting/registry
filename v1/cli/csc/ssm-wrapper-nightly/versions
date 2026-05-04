@@ -1,7 +1,7 @@
 {
   "versions": [
     {
-      "version": "nightly-20260504-dbfc567",
+      "version": "nightly-20260504-23a50bf",
       "platforms": [
         {
           "os": "universal",
