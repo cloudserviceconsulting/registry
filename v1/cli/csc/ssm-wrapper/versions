@@ -19,15 +19,6 @@
       ]
     },
     {
-      "version": "4.3.1",
-      "platforms": [
-        {
-          "os": "universal",
-          "arch": "universal"
-        }
-      ]
-    },
-    {
       "version": "4.3.3",
       "platforms": [
         {
