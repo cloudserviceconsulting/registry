@@ -7,14 +7,26 @@ builds with ``make -j1 build``, then ``sudo make -j1 install-internal`` when the
 bundle Makefile defines that target; otherwise copies ``dist/ssm`` and bin
 wrappers the same way ``install-internal`` does (for older registry zips).
 
+By default this installs ``ssm`` and ``ssmc`` wrappers plus shell completions for
+the shells listed under ``cli_updates.completion_shells`` in ``config.json``
+(default ``bash`` only). Omit **``--shell``** / **``--alternative``** to follow that
+config (same keys ``ssm -up`` uses). CLI flags override config for this run.
+
+Use ``--alternative`` for ``ec2`` / ``ecs`` wrappers, matching completions (``ec2``, ``ecs``, ``ssm.py``), and a ``ssm``
+symlink to ``/usr/local/ssm/ssm`` regardless of ``cli_updates.install_layout``.
+
 ``ssm -up`` invokes ``--zip PATH --sha256 HEX`` after the parent process has
-already downloaded and verified the bundle. Optional ``--release-version`` enables
+already downloaded and verified the bundle; layout and shells follow the same
+``cli_updates.install_layout`` and ``cli_updates.completion_shells`` keys (see
+``libs.core.meta``). Optional ``--release-version`` enables
 the post-install release-notes prompt (reads ``CHANGELOG.md`` from the extracted
 bundle; same opt-out as the CLI used: ``SSM_SKIP_CHANGELOG_PROMPT=1``).
 
-Optional ``--channel stable|nightly`` overrides ``config.json`` for this run
-(useful for ``curl … | python3 -`` bootstrap installs). In that mode ``sys.stdin``
-is the script pipe, not the terminal; interactive ``sudo`` still uses the
+Optional ``--channel stable|nightly`` chooses the registry tree for this run,
+persists ``cli_updates.channel`` after a successful install (JSON ``null`` for
+offline ``--zip`` installs without ``--channel`` — typical development), and is
+useful for ``curl … | python3 -`` bootstrap installs. In that pipe mode ``sys.stdin``
+is the script stream, not the terminal; interactive ``sudo`` still uses the
 controlling TTY via ``/dev/tty`` when available.
 
 This script is stdlib-only (no ``libs`` imports): release-notes parsing mirrors
@@ -35,7 +47,7 @@ import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple
 
 # Keep in sync with libs/core/meta.py and libs/config/registry_urls.py
 REGISTRY_RAW_BASE_STABLE = (
@@ -49,6 +61,39 @@ REGISTRY_RAW_BASE_NIGHTLY = (
 
 # Makefile reads this to redirect pip / PyInstaller (see Makefile ``_Q``).
 _INSTALL_QUIET_ENV = "INSTALL_FROM_REGISTRY_QUIET"
+_INSTALL_LAYOUT_ENV = "INSTALL_LAYOUT"
+_INSTALL_COMPLETION_SHELLS_ENV = "INSTALL_COMPLETION_SHELLS"
+
+# Same paths as Makefile ``completions-cleanup-internal`` (``prefix=/usr/local``).
+_REGISTRY_COMPLETION_INSTALL_PATHS: Tuple[str, ...] = (
+    "/usr/local/share/bash-completion/completions/ssm",
+    "/usr/local/share/bash-completion/completions/ssmc",
+    "/usr/local/share/bash-completion/completions/ec2",
+    "/usr/local/share/bash-completion/completions/ecs",
+    "/usr/local/share/bash-completion/completions/ssm.py",
+    "/usr/local/share/zsh/site-functions/_ssm",
+    "/usr/local/share/zsh/site-functions/_ssmc",
+    "/usr/local/share/zsh/site-functions/_ec2",
+    "/usr/local/share/zsh/site-functions/_ecs",
+    "/usr/local/share/zsh/site-functions/_ssm.py",
+)
+
+
+def _cleanup_registry_completion_files(run_privileged: Callable[[List[str]], None]) -> None:
+    """Remove installed completion scripts (matches Makefile ``completions-cleanup-internal``)."""
+    for path in _REGISTRY_COMPLETION_INSTALL_PATHS:
+        run_privileged(["rm", "-f", path])
+
+
+def _normalize_completion_shells(shell_append: Optional[List[str]]) -> Tuple[str, ...]:
+    """Return ordered unique shells for completion installs (default: bash only)."""
+    if not shell_append:
+        return ("bash",)
+    seen: List[str] = []
+    for s in shell_append:
+        if s not in seen:
+            seen.append(s)
+    return tuple(seen)
 
 
 def _controlling_tty_available() -> bool:
@@ -279,8 +324,16 @@ def _maybe_prompt_release_notes(bundle_root: Path, release_label: str) -> None:
     _print_release_notes(f"Changelog — [{rel}]", lines)
 
 
-def _bundle_subprocess_env() -> Dict[str, str]:
-    return {**os.environ, _INSTALL_QUIET_ENV: "1"}
+def _bundle_subprocess_env(
+    *,
+    layout: str = "default",
+    completion_shells: Sequence[str] = ("bash",),
+) -> Dict[str, str]:
+    env = {**os.environ, _INSTALL_QUIET_ENV: "1"}
+    env[_INSTALL_COMPLETION_SHELLS_ENV] = " ".join(completion_shells)
+    if layout == "alternative":
+        env[_INSTALL_LAYOUT_ENV] = "alternative"
+    return env
 
 
 def _die(_msg: str, code: int = 1) -> None:
@@ -309,6 +362,97 @@ def _ssm_config_dir() -> Path:
     if root:
         return Path(root).expanduser().resolve()
     return _xdg_config_home() / "ssm"
+
+
+def _read_install_layout_from_config() -> str:
+    """Return ``default`` or ``alternative`` from user ``config.json`` when set."""
+    for base in (_ssm_config_dir(), _caller_home() / ".ssm"):
+        path = base / "config.json"
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        cu = raw.get("cli_updates")
+        if not isinstance(cu, dict):
+            continue
+        il = cu.get("install_layout")
+        if isinstance(il, str):
+            low = il.strip().lower()
+            if low in ("default", "alternative"):
+                return low
+    return "default"
+
+
+def _read_completion_shells_from_config() -> Tuple[str, ...]:
+    """Return ``bash`` / ``zsh`` list from user ``config.json`` (default: bash only)."""
+    for base in (_ssm_config_dir(), _caller_home() / ".ssm"):
+        path = base / "config.json"
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        cu = raw.get("cli_updates")
+        if not isinstance(cu, dict):
+            continue
+        shells_ordered: List[str] = []
+        cs = cu.get("completion_shells")
+        if isinstance(cs, list):
+            for item in cs:
+                if not isinstance(item, str):
+                    continue
+                s = item.strip().lower()
+                if s in ("bash", "zsh") and s not in shells_ordered:
+                    shells_ordered.append(s)
+        if shells_ordered:
+            return tuple(shells_ordered)
+    return ("bash",)
+
+
+def _persist_cli_update_channel(registry_channel: Optional[str]) -> None:
+    """Merge ``cli_updates.channel`` into the invoking user's ``config.json``.
+
+    Uses the same directory resolution as config reads (``SSM_HOME`` / XDG under
+    ``SUDO_UID``). Skips the write when an existing ``config.json`` is not valid
+    JSON (avoids clobbering a broken file).
+
+    Args:
+        registry_channel: ``stable``, ``nightly``, or ``None`` (writes JSON ``null``
+            for development / offline zip installs without ``--channel``).
+    """
+    path = _ssm_config_dir() / "config.json"
+    raw: Dict[str, Any]
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(loaded, dict):
+            return
+        raw = loaded
+    else:
+        raw = {}
+    cu = raw.get("cli_updates")
+    if not isinstance(cu, dict):
+        cu = {}
+    cu.pop("last_applied_version", None)
+    if registry_channel in ("stable", "nightly"):
+        cu["channel"] = registry_channel
+    else:
+        cu["channel"] = None
+    raw["cli_updates"] = cu
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _read_update_channel() -> str:
@@ -424,9 +568,15 @@ def _find_extracted_bundle_root(extract_dir: Path) -> Path:
     raise AssertionError("unreachable")
 
 
-def _run_with_optional_tty(argv: List[str], *, cwd: str) -> None:
+def _run_with_optional_tty(
+    argv: List[str],
+    *,
+    cwd: str,
+    layout: str = "default",
+    completion_shells: Sequence[str] = ("bash",),
+) -> None:
     """Run subprocess; inherit TTY for sudo password prompts when possible."""
-    env = _bundle_subprocess_env()
+    env = _bundle_subprocess_env(layout=layout, completion_shells=completion_shells)
     sudoish = bool(argv) and argv[0] == "sudo"
     try:
         if sys.stdin.isatty():
@@ -501,22 +651,30 @@ def _run_with_optional_tty(argv: List[str], *, cwd: str) -> None:
         _die(f"{' '.join(argv)} failed (exit {proc.returncode}). {tail}")
 
 
-def _run_make_install_internal_returncode(bundle_root: Path) -> int:
+def _run_make_install_internal_returncode(
+    bundle_root: Path,
+    layout: str = "default",
+    completion_shells: Sequence[str] = ("bash",),
+) -> int:
     """Return exit code from ``make install-internal`` (0 = success)."""
     cwd = str(bundle_root.resolve())
-    env = _bundle_subprocess_env()
+    env = _bundle_subprocess_env(layout=layout, completion_shells=completion_shells)
+    shells_joined = " ".join(completion_shells)
+    # Pass knobs as ``make VAR=value`` so they override Makefile ``?=`` defaults even
+    # when ``sudo`` trims the environment (``sudo env VAR=value make`` is unreliable).
+    make_argv = [
+        "make",
+        "-j1",
+        f"{_INSTALL_QUIET_ENV}=1",
+        f"{_INSTALL_COMPLETION_SHELLS_ENV}={shells_joined}",
+    ]
+    if layout == "alternative":
+        make_argv.append(f"{_INSTALL_LAYOUT_ENV}=alternative")
+    make_argv.append("install-internal")
     if os.geteuid() != 0:
-        # ``sudo`` often resets the environment; ``env VAR=1`` keeps the Makefile quiet flag.
-        argv = [
-            "sudo",
-            "env",
-            f"{_INSTALL_QUIET_ENV}=1",
-            "make",
-            "-j1",
-            "install-internal",
-        ]
+        argv = ["sudo", *make_argv]
     else:
-        argv = ["make", "-j1", "install-internal"]
+        argv = list(make_argv)
     try:
         if sys.stdin.isatty():
             if os.geteuid() != 0:
@@ -581,13 +739,125 @@ def _run_make_install_internal_returncode(bundle_root: Path) -> int:
     return int(proc.returncode)
 
 
-def _copy_dist_to_usr_local_fallback(bundle_root: Path) -> None:
+def _install_alternative_completions_from_bundle(
+    bundle_root: Path,
+    run_privileged: Callable[[List[str]], None],
+    completion_shells: Sequence[str],
+) -> None:
+    """Install ec2/ecs/ssm.py completion files when present in the bundle.
+
+    Runs the same removal step as Makefile ``completions-cleanup-internal`` first so
+    leftover ``ssm`` / ``ssmc`` completion scripts do not persist after an
+    alternative layout install (notably when this fallback runs instead of
+    ``make install-internal``).
+
+    Args:
+        bundle_root: Extracted universal zip root (may contain ``completions/``).
+        run_privileged: Runs ``argv`` with sudo when needed (same as fallback helper).
+        completion_shells: Shell names to install (``bash`` and/or ``zsh``).
+
+    Returns:
+        None
+    """
+    _cleanup_registry_completion_files(run_privileged)
+    comp = bundle_root / "completions"
+    if not comp.is_dir():
+        return
+    bash_d = "/usr/local/share/bash-completion/completions"
+    zsh_d = "/usr/local/share/zsh/site-functions"
+    shell_set = frozenset(completion_shells)
+    bash_pairs = [
+        ("ec2.bash", f"{bash_d}/ec2"),
+        ("ecs.bash", f"{bash_d}/ecs"),
+        ("ssm.py.bash", f"{bash_d}/ssm.py"),
+    ]
+    zsh_pairs = [
+        ("ec2.zsh", f"{zsh_d}/_ec2"),
+        ("ecs.zsh", f"{zsh_d}/_ecs"),
+        ("ssm.py.zsh", f"{zsh_d}/_ssm.py"),
+    ]
+    if "bash" in shell_set:
+        for src_name, dest in bash_pairs:
+            src = comp / src_name
+            if not src.is_file():
+                continue
+            dest_parent = str(Path(dest).parent)
+            run_privileged(["install", "-d", dest_parent])
+            run_privileged(["install", "-m", "0644", str(src), dest])
+    if "zsh" in shell_set:
+        for src_name, dest in zsh_pairs:
+            src = comp / src_name
+            if not src.is_file():
+                continue
+            dest_parent = str(Path(dest).parent)
+            run_privileged(["install", "-d", dest_parent])
+            run_privileged(["install", "-m", "0644", str(src), dest])
+
+
+def _install_default_completions_from_bundle(
+    bundle_root: Path,
+    run_privileged: Callable[[List[str]], None],
+    completion_shells: Sequence[str],
+) -> None:
+    """Install ssm/ssmc completion files when present in the bundle.
+
+    Removes prior completion scripts under ``/usr/local/share/...`` first (same set
+    as Makefile ``completions-cleanup-internal``).
+
+    Args:
+        bundle_root: Extracted universal zip root (may contain ``completions/``).
+        run_privileged: Runs ``argv`` with sudo when needed (same as fallback helper).
+        completion_shells: Shell names to install (``bash`` and/or ``zsh``).
+
+    Returns:
+        None
+    """
+    _cleanup_registry_completion_files(run_privileged)
+    comp = bundle_root / "completions"
+    if not comp.is_dir():
+        return
+    bash_d = "/usr/local/share/bash-completion/completions"
+    zsh_d = "/usr/local/share/zsh/site-functions"
+    shell_set = frozenset(completion_shells)
+    bash_pairs = [
+        ("ssm.bash", f"{bash_d}/ssm"),
+        ("ssmc.bash", f"{bash_d}/ssmc"),
+    ]
+    zsh_pairs = [
+        ("ssm.zsh", f"{zsh_d}/_ssm"),
+        ("ssmc.zsh", f"{zsh_d}/_ssmc"),
+    ]
+    if "bash" in shell_set:
+        for src_name, dest in bash_pairs:
+            src = comp / src_name
+            if not src.is_file():
+                continue
+            dest_parent = str(Path(dest).parent)
+            run_privileged(["install", "-d", dest_parent])
+            run_privileged(["install", "-m", "0644", str(src), dest])
+    if "zsh" in shell_set:
+        for src_name, dest in zsh_pairs:
+            src = comp / src_name
+            if not src.is_file():
+                continue
+            dest_parent = str(Path(dest).parent)
+            run_privileged(["install", "-d", dest_parent])
+            run_privileged(["install", "-m", "0644", str(src), dest])
+
+
+def _copy_dist_to_usr_local_fallback(
+    bundle_root: Path,
+    *,
+    layout: str = "default",
+    completion_shells: Sequence[str] = ("bash",),
+) -> None:
     """Mirror ``Makefile`` ``install-internal`` when that target is missing or fails."""
     dist_ssm = bundle_root / "dist" / "ssm"
     if not dist_ssm.is_dir():
         _die(f"Missing PyInstaller output (expected directory): {dist_ssm}")
 
     def _run_privileged(argv: List[str]) -> None:
+        env = _bundle_subprocess_env(layout=layout, completion_shells=completion_shells)
         if os.geteuid() == 0:
             subprocess.run(
                 argv,
@@ -595,13 +865,49 @@ def _copy_dist_to_usr_local_fallback(bundle_root: Path) -> None:
                 timeout=600,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=_bundle_subprocess_env(),
+                env=env,
             )
         else:
-            _run_with_optional_tty(["sudo"] + argv, cwd=os.getcwd())
+            _run_with_optional_tty(
+                ["sudo"] + argv,
+                cwd=os.getcwd(),
+                layout=layout,
+                completion_shells=completion_shells,
+            )
 
     _run_privileged(["cp", "-rf", str(dist_ssm), "/usr/local/"])
 
+    if layout == "alternative":
+        ec2_wrap = b"#!/usr/bin/env bash\nexec /usr/local/ssm/ssm ec2 \"$@\"\n"
+        ecs_wrap = b"#!/usr/bin/env bash\nexec /usr/local/ssm/ssm ecs \"$@\"\n"
+        with tempfile.NamedTemporaryFile(delete=False, suffix="-ec2.sh") as f:
+            f.write(ec2_wrap)
+            p_ec2 = f.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix="-ecs.sh") as f:
+            f.write(ecs_wrap)
+            p_ecs = f.name
+        try:
+            os.chmod(p_ec2, 0o755)
+            os.chmod(p_ecs, 0o755)
+            _run_privileged(["rm", "-f", "/usr/local/bin/ssmc", "/usr/local/bin/ec2", "/usr/local/bin/ecs"])
+            _run_privileged(["install", "-m", "0755", p_ec2, "/usr/local/bin/ec2"])
+            _run_privileged(["install", "-m", "0755", p_ecs, "/usr/local/bin/ecs"])
+            _run_privileged(["rm", "-f", "/usr/local/bin/ssm"])
+            _run_privileged(["ln", "-sf", "/usr/local/ssm/ssm", "/usr/local/bin/ssm"])
+            _install_alternative_completions_from_bundle(
+                bundle_root,
+                _run_privileged,
+                completion_shells,
+            )
+        finally:
+            for p in (p_ec2, p_ecs):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        return
+
+    _run_privileged(["rm", "-f", "/usr/local/bin/ec2", "/usr/local/bin/ecs"])
     ssm_wrap = b"#!/usr/bin/env bash\nexec /usr/local/ssm/ssm ec2 \"$@\"\n"
     ssmc_wrap = b"#!/usr/bin/env bash\nexec /usr/local/ssm/ssm ecs \"$@\"\n"
     with tempfile.NamedTemporaryFile(delete=False, suffix="-ssm.sh") as f:
@@ -621,13 +927,18 @@ def _copy_dist_to_usr_local_fallback(bundle_root: Path) -> None:
                 os.unlink(p)
             except OSError:
                 pass
+    _install_default_completions_from_bundle(
+        bundle_root,
+        _run_privileged,
+        completion_shells,
+    )
 
 
 def _sudo_local_cleanup() -> None:
     """Remove prior CLI install under ``/usr/local`` (requires root or sudo)."""
     script = (
         "set -e; "
-        "rm -f /usr/local/bin/ssm /usr/local/bin/ssmc; "
+        "rm -f /usr/local/bin/ssm /usr/local/bin/ssmc /usr/local/bin/ec2 /usr/local/bin/ecs; "
         "rm -rf /usr/local/ssm /usr/local/ssmc"
     )
     if os.geteuid() == 0:
@@ -637,21 +948,36 @@ def _sudo_local_cleanup() -> None:
             timeout=120,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=_bundle_subprocess_env(),
+            env=_bundle_subprocess_env(layout="default"),
         )
     else:
-        _run_with_optional_tty(["sudo", "/bin/sh", "-c", script], cwd=os.getcwd())
+        _run_with_optional_tty(["sudo", "/bin/sh", "-c", script], cwd=os.getcwd(), layout="default")
 
 
-def _run_build_and_install_internal(bundle_root: Path) -> None:
+def _run_build_and_install_internal(
+    bundle_root: Path,
+    *,
+    layout: str = "default",
+    completion_shells: Sequence[str] = ("bash",),
+) -> None:
     cwd = str(bundle_root.resolve())
     _run_with_optional_tty(
         ["make", "-j1", "build"],
         cwd=cwd,
+        layout=layout,
+        completion_shells=completion_shells,
     )
-    rc = _run_make_install_internal_returncode(bundle_root)
+    rc = _run_make_install_internal_returncode(
+        bundle_root,
+        layout,
+        completion_shells,
+    )
     if rc != 0:
-        _copy_dist_to_usr_local_fallback(bundle_root)
+        _copy_dist_to_usr_local_fallback(
+            bundle_root,
+            layout=layout,
+            completion_shells=completion_shells,
+        )
 
 
 def _install_from_zip(
@@ -659,6 +985,9 @@ def _install_from_zip(
     expected_sha256: str,
     *,
     release_label: Optional[str] = None,
+    install_layout: str = "default",
+    completion_shells: Sequence[str] = ("bash",),
+    registry_channel: Optional[str] = None,
 ) -> None:
     tmp_root = Path(tempfile.mkdtemp(prefix="ssm-wrapper-extract-"))
     try:
@@ -673,15 +1002,25 @@ def _install_from_zip(
         zcopy.unlink(missing_ok=True)
         bundle_root = _find_extracted_bundle_root(tmp_root)
         _sudo_local_cleanup()
-        _run_build_and_install_internal(bundle_root)
+        _run_build_and_install_internal(
+            bundle_root,
+            layout=install_layout,
+            completion_shells=completion_shells,
+        )
         label = (release_label or "").strip()
         if label:
             _maybe_prompt_release_notes(bundle_root, label)
+        _persist_cli_update_channel(registry_channel)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
-def _full_registry_install(*, channel_override: Optional[str] = None) -> None:
+def _full_registry_install(
+    *,
+    channel_override: Optional[str] = None,
+    install_layout: str = "default",
+    completion_shells: Sequence[str] = ("bash",),
+) -> None:
     if not _can_prompt_privileged_commands():
         _die(
             "A terminal is required for sudo password prompts. "
@@ -719,7 +1058,14 @@ def _full_registry_install(*, channel_override: Optional[str] = None) -> None:
     zp = Path(zpath)
     try:
         zp.write_bytes(data)
-        _install_from_zip(zp, expected, release_label=latest)
+        _install_from_zip(
+            zp,
+            expected,
+            release_label=latest,
+            install_layout=install_layout,
+            completion_shells=completion_shells,
+            registry_channel=channel,
+        )
     finally:
         try:
             zp.unlink(missing_ok=True)
@@ -747,10 +1093,37 @@ def main() -> None:
         choices=("stable", "nightly"),
         help=(
             "Registry channel for this install (default: cli_updates.channel in "
-            "config.json, else stable). Useful when piping this script from curl."
+            "config.json, else stable). After success, written back to "
+            "cli_updates.channel (JSON null for zip installs without this flag). "
+            "Useful when piping this script from curl."
+        ),
+    )
+    p.add_argument(
+        "--alternative",
+        action="store_true",
+        help=(
+            "Install ec2/ecs wrappers and completions (ec2, ecs, ssm.py); symlink "
+            "/usr/local/bin/ssm to /usr/local/ssm/ssm. Overrides "
+            "cli_updates.install_layout for this run."
+        ),
+    )
+    p.add_argument(
+        "--shell",
+        action="append",
+        choices=("bash", "zsh"),
+        metavar="SHELL",
+        help=(
+            "Install completions for this shell (repeatable): bash or zsh. "
+            "Overrides cli_updates.completion_shells for this run."
         ),
     )
     args = p.parse_args()
+    config_layout = _read_install_layout_from_config()
+    layout = "alternative" if args.alternative else config_layout
+    if args.shell:
+        shells = _normalize_completion_shells(args.shell)
+    else:
+        shells = _read_completion_shells_from_config()
     if bool(args.zip) ^ bool(args.sha256):
         _die("Both --zip and --sha256 are required together.")
     if args.zip is not None:
@@ -758,9 +1131,20 @@ def main() -> None:
             _die(f"Zip not found: {args.zip}")
         assert args.sha256 is not None
         rv = (args.release_version or "").strip() or None
-        _install_from_zip(args.zip, args.sha256, release_label=rv)
+        _install_from_zip(
+            args.zip,
+            args.sha256,
+            release_label=rv,
+            install_layout=layout,
+            completion_shells=shells,
+            registry_channel=args.channel,
+        )
         return
-    _full_registry_install(channel_override=args.channel)
+    _full_registry_install(
+        channel_override=args.channel,
+        install_layout=layout,
+        completion_shells=shells,
+    )
 
 
 if __name__ == "__main__":
