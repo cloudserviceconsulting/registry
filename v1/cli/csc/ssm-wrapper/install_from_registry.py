@@ -22,12 +22,13 @@ already downloaded and verified the bundle; layout and shells follow the same
 the post-install release-notes prompt (reads ``CHANGELOG.md`` from the extracted
 bundle; same opt-out as the CLI used: ``SSM_SKIP_CHANGELOG_PROMPT=1``).
 
-Optional ``--channel stable|nightly`` chooses the registry tree for this run,
-persists ``cli_updates.channel`` after a successful install (JSON ``null`` for
-offline ``--zip`` installs without ``--channel`` — typical development), and is
-useful for ``curl … | python3 -`` bootstrap installs. In that pipe mode ``sys.stdin``
-is the script stream, not the terminal; interactive ``sudo`` still uses the
-controlling TTY via ``/dev/tty`` when available.
+Optional ``--channel stable|nightly`` chooses the registry tree for this run.
+After a successful install, writes ``cli_updates.channel`` (JSON ``null`` for
+offline ``--zip`` installs without ``--channel`` — typical development),
+``cli_updates.install_layout``, and ``cli_updates.completion_shells`` to match
+what was installed. Useful for ``curl … | python3 -`` bootstrap installs. In that
+pipe mode ``sys.stdin`` is the script stream, not the terminal; interactive
+``sudo`` still uses the controlling TTY via ``/dev/tty`` when available.
 
 This script is stdlib-only (no ``libs`` imports): release-notes parsing mirrors
 ``libs/core/changelog_preview.py`` so it runs under plain ``python3``.
@@ -351,10 +352,14 @@ def _caller_home() -> Path:
 
 
 def _xdg_config_home() -> Path:
+    """XDG config home; under ``sudo`` always uses the invoking user's tree."""
+    su = os.environ.get("SUDO_UID", "").strip()
+    if su.isdigit():
+        return (_caller_home() / ".config").resolve()
     xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     if xdg:
         return Path(xdg).expanduser().resolve()
-    return (_caller_home() / ".config").resolve()
+    return (Path.home() / ".config").resolve()
 
 
 def _ssm_config_dir() -> Path:
@@ -416,16 +421,39 @@ def _read_completion_shells_from_config() -> Tuple[str, ...]:
     return ("bash",)
 
 
-def _persist_cli_update_channel(registry_channel: Optional[str]) -> None:
-    """Merge ``cli_updates.channel`` into the invoking user's ``config.json``.
+def _chown_path_to_invoker(path: Path) -> None:
+    """When running as root via ``sudo``, set ownership to ``SUDO_UID`` / ``SUDO_GID``."""
+    su = os.environ.get("SUDO_UID", "").strip()
+    sg = os.environ.get("SUDO_GID", "").strip()
+    if os.geteuid() != 0 or not su.isdigit() or not sg.isdigit():
+        return
+    try:
+        uid, gid = int(su), int(sg)
+        os.chown(path, uid, gid)
+    except OSError:
+        pass
+
+
+def _persist_cli_update_prefs(
+    *,
+    registry_channel: Optional[str] = None,
+    install_layout: Optional[str] = None,
+    completion_shells: Optional[Sequence[str]] = None,
+    clear_channel: bool = False,
+) -> None:
+    """Merge ``cli_updates`` install prefs into the invoking user's ``config.json``.
 
     Uses the same directory resolution as config reads (``SSM_HOME`` / XDG under
     ``SUDO_UID``). Skips the write when an existing ``config.json`` is not valid
     JSON (avoids clobbering a broken file).
 
     Args:
-        registry_channel: ``stable``, ``nightly``, or ``None`` (writes JSON ``null``
-            for development / offline zip installs without ``--channel``).
+        registry_channel: ``stable`` or ``nightly`` when the channel should be set.
+        install_layout: ``default`` or ``alternative`` when layout should be updated.
+        completion_shells: Shell names when ``completion_shells`` should be updated.
+        clear_channel: When True and *registry_channel* is omitted, set ``channel``
+            to JSON ``null`` (registry/offline zip installs without ``--channel``).
+            When False and *registry_channel* is omitted, leave ``channel`` unchanged.
     """
     path = _ssm_config_dir() / "config.json"
     raw: Dict[str, Any]
@@ -445,12 +473,27 @@ def _persist_cli_update_channel(registry_channel: Optional[str]) -> None:
     cu.pop("last_applied_version", None)
     if registry_channel in ("stable", "nightly"):
         cu["channel"] = registry_channel
-    else:
+    elif clear_channel:
         cu["channel"] = None
+    if install_layout is not None:
+        layout = install_layout.strip().lower()
+        cu["install_layout"] = layout if layout == "alternative" else "default"
+    if completion_shells is not None:
+        shells_ordered: List[str] = []
+        for item in completion_shells:
+            if not isinstance(item, str):
+                continue
+            s = item.strip().lower()
+            if s in ("bash", "zsh") and s not in shells_ordered:
+                shells_ordered.append(s)
+        cu["completion_shells"] = shells_ordered or ["bash"]
     raw["cli_updates"] = cu
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        _chown_path_to_invoker(path)
+        if path.parent.name == "ssm":
+            _chown_path_to_invoker(path.parent)
     except OSError:
         pass
 
@@ -1010,7 +1053,12 @@ def _install_from_zip(
         label = (release_label or "").strip()
         if label:
             _maybe_prompt_release_notes(bundle_root, label)
-        _persist_cli_update_channel(registry_channel)
+        _persist_cli_update_prefs(
+            registry_channel=registry_channel,
+            install_layout=install_layout,
+            completion_shells=completion_shells,
+            clear_channel=(registry_channel is None),
+        )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -1073,6 +1121,25 @@ def _full_registry_install(
             pass
 
 
+def _write_cli_updates_from_args(args: argparse.Namespace) -> None:
+    """Persist ``cli_updates`` from Makefile / ``--write-cli-updates`` (no install).
+
+    Local / development installs (``make install-dev``) clear ``channel`` to JSON
+    ``null`` unless ``--channel`` is passed explicitly.
+    """
+    layout = "alternative" if args.alternative else "default"
+    if args.shell:
+        shells = _normalize_completion_shells(args.shell)
+    else:
+        shells = ("bash",)
+    _persist_cli_update_prefs(
+        registry_channel=args.channel,
+        install_layout=layout,
+        completion_shells=shells,
+        clear_channel=(args.channel is None),
+    )
+
+
 def main() -> None:
     """Parse CLI flags and run a full registry install or a staged zip install."""
     p = argparse.ArgumentParser(description=__doc__)
@@ -1094,7 +1161,8 @@ def main() -> None:
         help=(
             "Registry channel for this install (default: cli_updates.channel in "
             "config.json, else stable). After success, written back to "
-            "cli_updates.channel (JSON null for zip installs without this flag). "
+            "cli_updates.channel (JSON null for zip installs without this flag), "
+            "cli_updates.install_layout, and cli_updates.completion_shells. "
             "Useful when piping this script from curl."
         ),
     )
@@ -1117,7 +1185,15 @@ def main() -> None:
             "Overrides cli_updates.completion_shells for this run."
         ),
     )
+    p.add_argument(
+        "--write-cli-updates",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = p.parse_args()
+    if args.write_cli_updates:
+        _write_cli_updates_from_args(args)
+        return
     config_layout = _read_install_layout_from_config()
     layout = "alternative" if args.alternative else config_layout
     if args.shell:
