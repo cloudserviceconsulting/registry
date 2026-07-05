@@ -352,14 +352,14 @@ def _caller_home() -> Path:
 
 
 def _xdg_config_home() -> Path:
-    """XDG config home; under ``sudo`` always uses the invoking user's tree."""
-    su = os.environ.get("SUDO_UID", "").strip()
-    if su.isdigit():
-        return (_caller_home() / ".config").resolve()
+    """XDG config home for the invoking user (``sudo`` uses ``SUDO_UID`` home).
+
+    Honors ``XDG_CONFIG_HOME`` when set; otherwise ``<caller_home>/.config``.
+    """
     xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     if xdg:
         return Path(xdg).expanduser().resolve()
-    return (Path.home() / ".config").resolve()
+    return (_caller_home() / ".config").resolve()
 
 
 def _ssm_config_dir() -> Path:
