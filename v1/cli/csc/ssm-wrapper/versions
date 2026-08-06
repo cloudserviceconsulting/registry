@@ -35,6 +35,15 @@
           "arch": "universal"
         }
       ]
+    },
+    {
+      "version": "4.9.0",
+      "platforms": [
+        {
+          "os": "universal",
+          "arch": "universal"
+        }
+      ]
     }
   ]
 }
