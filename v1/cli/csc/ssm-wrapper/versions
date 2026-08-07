@@ -44,6 +44,15 @@
           "arch": "universal"
         }
       ]
+    },
+    {
+      "version": "4.9.1",
+      "platforms": [
+        {
+          "os": "universal",
+          "arch": "universal"
+        }
+      ]
     }
   ]
 }
