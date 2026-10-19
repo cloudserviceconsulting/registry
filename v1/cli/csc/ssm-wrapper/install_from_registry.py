@@ -1516,3 +1516,7 @@ def main() -> None:
             state = "Your previous install was not changed."
         print(f"\nInstallation cancelled. {state}", file=sys.stderr, flush=True)
         raise SystemExit(130) from exc
+
+
+if __name__ == "__main__":
+    main()
