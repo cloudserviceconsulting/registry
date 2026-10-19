@@ -41,10 +41,13 @@ import hashlib
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -66,6 +69,53 @@ _INSTALL_LAYOUT_ENV = "INSTALL_LAYOUT"
 _INSTALL_COMPLETION_SHELLS_ENV = "INSTALL_COMPLETION_SHELLS"
 
 # Same paths as Makefile ``completions-cleanup-internal`` (``prefix=/usr/local``).
+_INSTALL_TOTAL_STEPS = 6
+
+
+class _Interrupted(Exception):
+    """Installation stopped by user interrupt or signal."""
+
+    def __init__(self, phase: str) -> None:
+        super().__init__(phase)
+        self.phase = phase
+
+
+_INSTALL_PHASE: Optional[str] = None
+
+
+def _install_verbose() -> bool:
+    """True when install subprocess output should stream to the terminal."""
+    if os.environ.get("SSM_INSTALL_VERBOSE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
+    return "--verbose" in sys.argv
+
+
+def _step(n: int, text: str) -> None:
+    """Print a numbered install step to stderr."""
+    print(f"[{n}/{_INSTALL_TOTAL_STEPS}] {text}", file=sys.stderr, flush=True)
+
+
+def _note(text: str) -> None:
+    """Print a sub-line under the current step."""
+    print(f"  {text}", file=sys.stderr, flush=True)
+
+
+def _format_elapsed(seconds: float) -> str:
+    s = int(max(0, seconds))
+    m, sec = divmod(s, 60)
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def _subprocess_interrupted(rc: int) -> bool:
+    return rc < 0 or rc == 130
+
+
 _REGISTRY_COMPLETION_INSTALL_PATHS: Tuple[str, ...] = (
     "/usr/local/share/bash-completion/completions/ssm",
     "/usr/local/share/bash-completion/completions/ssmc",
@@ -307,13 +357,33 @@ def _maybe_prompt_release_notes(bundle_root: Path, release_label: str) -> None:
             return
         read_fn = tty_in
 
-    prompt = "Show release notes for this version in the terminal? (y/N) "
+    if not sys.stdout.isatty():
+        if tty_in is not None:
+            tty_in.close()
+        return
+
+    prompt = (
+        f"Show release notes for {rel}? [y/N, Enter to skip, auto-skip in 20s] "
+    )
+    ans = ""
     try:
         if read_fn is None:
-            ans = input(prompt).strip().lower()
+            print(prompt, end="", flush=True)
+            rlist, _, _ = select.select([sys.stdin], [], [], 20.0)
+            if rlist:
+                ans = sys.stdin.readline().strip().lower()
+            else:
+                print()
+                return
         else:
             print(prompt, end="", flush=True)
-            ans = read_fn.readline().strip().lower()
+            fd = read_fn.fileno()
+            rlist, _, _ = select.select([fd], [], [], 20.0)
+            if rlist:
+                ans = read_fn.readline().strip().lower()
+            else:
+                print()
+                return
     except (EOFError, KeyboardInterrupt):
         print()
         return
@@ -329,15 +399,19 @@ def _bundle_subprocess_env(
     *,
     layout: str = "default",
     completion_shells: Sequence[str] = ("bash",),
+    quiet: bool = False,
 ) -> Dict[str, str]:
-    env = {**os.environ, _INSTALL_QUIET_ENV: "1"}
+    env = {**os.environ}
+    if quiet:
+        env[_INSTALL_QUIET_ENV] = "1"
     env[_INSTALL_COMPLETION_SHELLS_ENV] = " ".join(completion_shells)
     if layout == "alternative":
         env[_INSTALL_LAYOUT_ENV] = "alternative"
     return env
 
 
-def _die(_msg: str, code: int = 1) -> None:
+def _die(msg: str, code: int = 1) -> None:
+    print(f"error: {msg}", file=sys.stderr, flush=True)
     raise SystemExit(code)
 
 
@@ -440,6 +514,8 @@ def _persist_cli_update_prefs(
     install_layout: Optional[str] = None,
     completion_shells: Optional[Sequence[str]] = None,
     clear_channel: bool = False,
+    pinned_version: Optional[str] = None,
+    clear_pinned: bool = False,
 ) -> None:
     """Merge ``cli_updates`` install prefs into the invoking user's ``config.json``.
 
@@ -454,6 +530,8 @@ def _persist_cli_update_prefs(
         clear_channel: When True and *registry_channel* is omitted, set ``channel``
             to JSON ``null`` (registry/offline zip installs without ``--channel``).
             When False and *registry_channel* is omitted, leave ``channel`` unchanged.
+        pinned_version: When set, writes ``cli_updates.pinned_version``.
+        clear_pinned: When True, sets ``pinned_version`` to JSON ``null``.
     """
     path = _ssm_config_dir() / "config.json"
     raw: Dict[str, Any]
@@ -487,6 +565,10 @@ def _persist_cli_update_prefs(
             if s in ("bash", "zsh") and s not in shells_ordered:
                 shells_ordered.append(s)
         cu["completion_shells"] = shells_ordered or ["bash"]
+    if clear_pinned:
+        cu["pinned_version"] = None
+    elif pinned_version is not None:
+        cu["pinned_version"] = pinned_version.strip() or None
     raw["cli_updates"] = cu
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,10 +619,51 @@ def _registry_base(channel: str) -> str:
 def _http_get(url: str, timeout: int = 120) -> bytes:
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "ssm-wrapper-install-from-registry"},
+        headers={
+            "User-Agent": "ssm-wrapper-install-from-registry",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+def _http_get_with_progress(url: str, timeout: int = 180) -> bytes:
+    """Download *url* with optional progress on stderr."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "ssm-wrapper-install-from-registry",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        total = resp.headers.get("Content-Length")
+        total_n = int(total) if total and str(total).isdigit() else None
+        chunks: List[bytes] = []
+        read = 0
+        block = 256 * 1024
+        tty = sys.stderr.isatty()
+        while True:
+            part = resp.read(block)
+            if not part:
+                break
+            chunks.append(part)
+            read += len(part)
+            if total_n:
+                pct = min(100, int(read * 100 / total_n))
+                msg = f"Downloading… {read // (1024 * 1024)}.{read % (1024 * 1024) // 102400} MB ({pct}%)"
+            else:
+                msg = f"Downloading… {read // (1024 * 1024)} MB"
+            if tty:
+                print(f"\r  {msg}", end="", file=sys.stderr, flush=True)
+            elif read % (5 * 1024 * 1024) < block:
+                _note(msg)
+        if tty and read:
+            print(file=sys.stderr)
+        return b"".join(chunks)
 
 
 def _semver_tuple(version: str) -> Tuple[int, int, int]:
@@ -597,6 +720,109 @@ def _fetch_download_meta(base: str, version: str) -> Dict[str, Any]:
     return json.loads(meta_raw.decode("utf-8"))
 
 
+def _resolve_subprocess_stdio(
+    sudoish: bool,
+    *,
+    stream_output: bool,
+    log_file: Optional[TextIO],
+) -> Tuple[Any, Any, Any, Optional[TextIO]]:
+    """
+    Return ``(stdin, stdout, stderr, tty_in_to_close)`` for ``Popen``.
+
+    When *stream_output* is False and *log_file* is set, stdout/stderr go to the log.
+    """
+    tty_in: Optional[TextIO] = None
+    if sudoish:
+        if sys.stdin.isatty():
+            stdin = sys.stdin
+        else:
+            tty_in = _open_controlling_tty_stdin()
+            stdin = tty_in if tty_in is not None else subprocess.DEVNULL
+    else:
+        stdin = sys.stdin if sys.stdin.isatty() else subprocess.DEVNULL
+
+    if stream_output:
+        stdout = stderr = None
+    elif log_file is not None:
+        stdout = stderr = log_file
+    else:
+        stdout = stderr = subprocess.DEVNULL
+
+    return stdin, stdout, stderr, tty_in
+
+
+def _run_step_subprocess(
+    argv: List[str],
+    *,
+    cwd: str,
+    env: Dict[str, str],
+    stream_output: bool = False,
+    log_file: Optional[TextIO] = None,
+    heartbeat_label: Optional[str] = None,
+    capture_on_failure: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run *argv* with heartbeat lines; raise :class:`_Interrupted` on Ctrl-C."""
+    sudoish = bool(argv) and argv[0] == "sudo"
+    stdin, stdout, stderr, tty_in = _resolve_subprocess_stdio(
+        sudoish,
+        stream_output=stream_output,
+        log_file=log_file,
+    )
+    proc: subprocess.Popen[Any]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        _die(f"command not found: {exc}")
+        raise AssertionError("unreachable")
+    start = time.monotonic()
+    last_hb = start
+    hb_interval = 15.0 if sys.stderr.isatty() else 30.0
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if heartbeat_label and now - last_hb >= hb_interval:
+                    elapsed = _format_elapsed(now - start)
+                    msg = f"  still {heartbeat_label}… {elapsed}"
+                    if sys.stderr.isatty():
+                        print(f"\r{msg}", end="", file=sys.stderr, flush=True)
+                    else:
+                        _note(msg.strip())
+                    last_hb = now
+        if sys.stderr.isatty() and heartbeat_label:
+            print(file=sys.stderr)
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        raise _Interrupted(_INSTALL_PHASE or "unknown")
+    finally:
+        if tty_in is not None:
+            tty_in.close()
+
+    if _subprocess_interrupted(rc):
+        raise _Interrupted(_INSTALL_PHASE or "unknown")
+
+    tail = ""
+    if capture_on_failure and rc != 0:
+        tail = "(see command output above)"
+    cp = subprocess.CompletedProcess(argv, rc, None, tail)
+    return cp
+
+
 def _find_extracted_bundle_root(extract_dir: Path) -> Path:
     if (extract_dir / "Makefile").is_file() and (extract_dir / "ssm.py").is_file():
         return extract_dir
@@ -617,80 +843,31 @@ def _run_with_optional_tty(
     cwd: str,
     layout: str = "default",
     completion_shells: Sequence[str] = ("bash",),
+    quiet: bool = True,
+    stream_output: bool = False,
+    log_file: Optional[TextIO] = None,
+    heartbeat_label: Optional[str] = None,
 ) -> None:
     """Run subprocess; inherit TTY for sudo password prompts when possible."""
-    env = _bundle_subprocess_env(layout=layout, completion_shells=completion_shells)
-    sudoish = bool(argv) and argv[0] == "sudo"
+    env = _bundle_subprocess_env(
+        layout=layout,
+        completion_shells=completion_shells,
+        quiet=quiet,
+    )
     try:
-        if sys.stdin.isatty():
-            if sudoish:
-                proc = subprocess.run(
-                    argv,
-                    cwd=cwd,
-                    stdin=sys.stdin,
-                    stdout=None,
-                    stderr=None,
-                    timeout=3600,
-                    check=False,
-                    env=env,
-                )
-            else:
-                proc = subprocess.run(
-                    argv,
-                    cwd=cwd,
-                    stdin=sys.stdin,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3600,
-                    check=False,
-                    env=env,
-                )
-        elif sudoish:
-            tty_in = _open_controlling_tty_stdin()
-            if tty_in is None:
-                proc = subprocess.run(
-                    argv,
-                    cwd=cwd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=3600,
-                    check=False,
-                    env=env,
-                )
-            else:
-                try:
-                    proc = subprocess.run(
-                        argv,
-                        cwd=cwd,
-                        stdin=tty_in,
-                        stdout=None,
-                        stderr=None,
-                        timeout=3600,
-                        check=False,
-                        env=env,
-                    )
-                finally:
-                    tty_in.close()
-        else:
-            proc = subprocess.run(
-                argv,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3600,
-                check=False,
-                env=env,
-            )
-    except FileNotFoundError as exc:
-        _die(f"command not found: {exc}")
-    except subprocess.TimeoutExpired:
-        _die(f"command timed out: {argv!r}")
+        proc = _run_step_subprocess(
+            argv,
+            cwd=cwd,
+            env=env,
+            stream_output=stream_output or _install_verbose(),
+            log_file=log_file,
+            heartbeat_label=heartbeat_label,
+            capture_on_failure=True,
+        )
+    except _Interrupted:
+        raise
     if proc.returncode != 0:
-        tail = ""
-        if hasattr(proc, "stderr") and proc.stderr:
-            tail = str(proc.stderr).strip()[:1200]
+        tail = (proc.stderr or "").strip()[:1200]
         _die(f"{' '.join(argv)} failed (exit {proc.returncode}). {tail}")
 
 
@@ -701,10 +878,12 @@ def _run_make_install_internal_returncode(
 ) -> int:
     """Return exit code from ``make install-internal`` (0 = success)."""
     cwd = str(bundle_root.resolve())
-    env = _bundle_subprocess_env(layout=layout, completion_shells=completion_shells)
+    env = _bundle_subprocess_env(
+        layout=layout,
+        completion_shells=completion_shells,
+        quiet=True,
+    )
     shells_joined = " ".join(completion_shells)
-    # Pass knobs as ``make VAR=value`` so they override Makefile ``?=`` defaults even
-    # when ``sudo`` trims the environment (``sudo env VAR=value make`` is unreliable).
     make_argv = [
         "make",
         "-j1",
@@ -719,66 +898,17 @@ def _run_make_install_internal_returncode(
     else:
         argv = list(make_argv)
     try:
-        if sys.stdin.isatty():
-            if os.geteuid() != 0:
-                proc = subprocess.run(
-                    argv,
-                    cwd=cwd,
-                    stdin=sys.stdin,
-                    stdout=None,
-                    stderr=None,
-                    timeout=3600,
-                    env=env,
-                )
-            else:
-                proc = subprocess.run(
-                    argv,
-                    cwd=cwd,
-                    stdin=sys.stdin,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3600,
-                    env=env,
-                )
-        elif os.geteuid() != 0:
-            tty_in = _open_controlling_tty_stdin()
-            if tty_in is None:
-                proc = subprocess.run(
-                    argv,
-                    cwd=cwd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=3600,
-                    env=env,
-                )
-            else:
-                try:
-                    proc = subprocess.run(
-                        argv,
-                        cwd=cwd,
-                        stdin=tty_in,
-                        stdout=None,
-                        stderr=None,
-                        timeout=3600,
-                        env=env,
-                    )
-                finally:
-                    tty_in.close()
-        else:
-            proc = subprocess.run(
-                argv,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3600,
-                env=env,
-            )
+        proc = _run_step_subprocess(
+            argv,
+            cwd=cwd,
+            env=env,
+            stream_output=_install_verbose(),
+            heartbeat_label="installing under /usr/local",
+        )
+    except _Interrupted:
+        raise
     except FileNotFoundError:
         return 127
-    except subprocess.TimeoutExpired:
-        return 124
     return int(proc.returncode)
 
 
@@ -997,24 +1127,91 @@ def _sudo_local_cleanup() -> None:
         _run_with_optional_tty(["sudo", "/bin/sh", "-c", script], cwd=os.getcwd(), layout="default")
 
 
+def _print_build_log_tail(log_path: Path, *, max_lines: int = 25) -> None:
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    if not lines:
+        return
+    _note(f"Build log (last {max_lines} lines): {log_path}")
+    for line in lines[-max_lines:]:
+        _note(line)
+
+
 def _run_build_and_install_internal(
     bundle_root: Path,
     *,
     layout: str = "default",
     completion_shells: Sequence[str] = ("bash",),
 ) -> None:
+    global _INSTALL_PHASE
     cwd = str(bundle_root.resolve())
-    _run_with_optional_tty(
-        ["make", "-j1", "build"],
-        cwd=cwd,
-        layout=layout,
-        completion_shells=completion_shells,
+    log_path: Optional[Path] = None
+    log_f: Optional[TextIO] = None
+    verbose = _install_verbose()
+    if not verbose:
+        fd, log_name = tempfile.mkstemp(prefix="ssm-wrapper-install-", suffix=".log")
+        os.close(fd)
+        log_path = Path(log_name)
+        log_f = open(log_path, "w", encoding="utf-8")
+
+    _INSTALL_PHASE = "build"
+    _step(
+        4,
+        "Building ssm-wrapper (venv, dependencies, PyInstaller) — usually 2–5 minutes",
     )
-    rc = _run_make_install_internal_returncode(
-        bundle_root,
-        layout,
-        completion_shells,
-    )
+    build_ok = False
+    try:
+        _run_with_optional_tty(
+            ["make", "-j1", "build"],
+            cwd=cwd,
+            layout=layout,
+            completion_shells=completion_shells,
+            quiet=False,
+            stream_output=verbose,
+            log_file=log_f,
+            heartbeat_label="building",
+        )
+        build_ok = True
+    except _Interrupted:
+        if log_path is not None and log_path.is_file():
+            _print_build_log_tail(log_path)
+        raise
+    except SystemExit:
+        if log_path is not None and log_path.is_file():
+            _print_build_log_tail(log_path)
+        raise
+    finally:
+        if log_f is not None:
+            log_f.close()
+        if build_ok and log_path is not None and log_path.is_file():
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
+
+    _step(5, "Preparing privileged install (sudo)")
+    if os.geteuid() != 0:
+        _note("Administrator password needed to write /usr/local (sudo)")
+        _run_with_optional_tty(
+            ["sudo", "-v"],
+            cwd=os.getcwd(),
+            layout=layout,
+            completion_shells=completion_shells,
+        )
+
+    _INSTALL_PHASE = "install"
+    _step(6, "Installing under /usr/local (replacing prior ssm-wrapper files)")
+    _sudo_local_cleanup()
+    try:
+        rc = _run_make_install_internal_returncode(
+            bundle_root,
+            layout,
+            completion_shells,
+        )
+    except _Interrupted:
+        raise
     if rc != 0:
         _copy_dist_to_usr_local_fallback(
             bundle_root,
@@ -1031,20 +1228,23 @@ def _install_from_zip(
     install_layout: str = "default",
     completion_shells: Sequence[str] = ("bash",),
     registry_channel: Optional[str] = None,
+    pinned_version: Optional[str] = None,
+    clear_pinned: bool = False,
 ) -> None:
     tmp_root = Path(tempfile.mkdtemp(prefix="ssm-wrapper-extract-"))
     try:
+        _step(1, "Reading and verifying bundle checksum")
         data = zip_path.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         if digest != expected_sha256.strip().lower():
             _die("Bundle checksum does not match expected value (possible tampering).")
+        _step(2, "Extracting bundle")
         zcopy = tmp_root / "bundle.zip"
         zcopy.write_bytes(data)
         with zipfile.ZipFile(zcopy) as zf:
             zf.extractall(tmp_root)
         zcopy.unlink(missing_ok=True)
         bundle_root = _find_extracted_bundle_root(tmp_root)
-        _sudo_local_cleanup()
         _run_build_and_install_internal(
             bundle_root,
             layout=install_layout,
@@ -1052,15 +1252,56 @@ def _install_from_zip(
         )
         label = (release_label or "").strip()
         if label:
+            print(
+                f"Installed ssm-wrapper {label} to /usr/local/ssm (ssm, ssmc). Done.",
+                file=sys.stderr,
+                flush=True,
+            )
             _maybe_prompt_release_notes(bundle_root, label)
+        else:
+            print(
+                "Installed ssm-wrapper to /usr/local/ssm (ssm, ssmc). Done.",
+                file=sys.stderr,
+                flush=True,
+            )
         _persist_cli_update_prefs(
             registry_channel=registry_channel,
             install_layout=install_layout,
             completion_shells=completion_shells,
             clear_channel=(registry_channel is None),
+            pinned_version=pinned_version,
+            clear_pinned=clear_pinned,
         )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _registry_versions_sorted(doc: Dict[str, Any]) -> List[str]:
+    entries = doc.get("versions")
+    if not isinstance(entries, list):
+        return []
+    ids: List[str] = []
+    for item in entries:
+        if isinstance(item, dict):
+            ver = item.get("version")
+            if ver and isinstance(ver, str) and ver.strip():
+                ids.append(ver.strip())
+    return sorted(ids, key=_version_sort_key, reverse=True)
+
+
+def _version_in_registry_doc(doc: Dict[str, Any], version: str) -> bool:
+    want = version.strip()
+    return want in _registry_versions_sorted(doc)
+
+
+def _print_installer_version_list(channel: str, doc: Dict[str, Any], latest: str) -> None:
+    print(f"Available versions ({channel}):", file=sys.stderr, flush=True)
+    for ver in _registry_versions_sorted(doc):
+        tags: List[str] = []
+        if ver == latest:
+            tags.append("latest")
+        suffix = f" ({', '.join(tags)})" if tags else ""
+        print(f"  {ver}{suffix}", file=sys.stderr, flush=True)
 
 
 def _full_registry_install(
@@ -1068,8 +1309,10 @@ def _full_registry_install(
     channel_override: Optional[str] = None,
     install_layout: str = "default",
     completion_shells: Sequence[str] = ("bash",),
+    install_version: Optional[str] = None,
+    list_versions_only: bool = False,
 ) -> None:
-    if not _can_prompt_privileged_commands():
+    if not list_versions_only and not _can_prompt_privileged_commands():
         _die(
             "A terminal is required for sudo password prompts. "
             "Use an interactive shell (or save the script and run "
@@ -1078,6 +1321,7 @@ def _full_registry_install(
         )
     channel = _resolve_install_channel(channel_override)
     base = _registry_base(channel)
+    _step(1, f"Fetching version list from registry ({channel})")
     try:
         doc = json.loads(_http_get(f"{base}/versions").decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -1085,8 +1329,22 @@ def _full_registry_install(
     latest = _latest_registry_version(doc)
     if not latest:
         _die("Registry returned no versions.")
+    if list_versions_only:
+        _print_installer_version_list(channel, doc, latest)
+        return
+
+    target = (install_version or "").strip() or latest
+    explicit = bool((install_version or "").strip())
+    if explicit and not _version_in_registry_doc(doc, target):
+        _die(
+            f"Version {target!r} not found on channel {channel!r}. "
+            f"Run: python3 install_from_registry.py --list-versions "
+            f"{f'--channel {channel} ' if channel_override else ''}".strip(),
+        )
+
+    _step(2, f"Downloading bundle {target}")
     try:
-        dl = _fetch_download_meta(base, latest)
+        dl = _fetch_download_meta(base, target)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         _die(f"Could not read download metadata: {exc}")
     url = dl.get("download_url")
@@ -1095,7 +1353,7 @@ def _full_registry_install(
         _die("Registry metadata missing download_url or shasum.")
     expected = str(expected).strip().lower()
     try:
-        data = _http_get(str(url), timeout=180)
+        data = _http_get_with_progress(str(url), timeout=180)
     except OSError as exc:
         _die(f"Could not download bundle: {exc}")
     digest = hashlib.sha256(data).hexdigest()
@@ -1104,15 +1362,21 @@ def _full_registry_install(
     fd, zpath = tempfile.mkstemp(prefix="ssm-bundle-", suffix=".zip")
     os.close(fd)
     zp = Path(zpath)
+    pin: Optional[str] = None
+    clear_pin = not explicit or target == latest
+    if explicit and _registry_version_gt(latest, target):
+        pin = target
     try:
         zp.write_bytes(data)
         _install_from_zip(
             zp,
             expected,
-            release_label=latest,
+            release_label=target,
             install_layout=install_layout,
             completion_shells=completion_shells,
             registry_channel=channel,
+            pinned_version=pin,
+            clear_pinned=clear_pin,
         )
     finally:
         try:
@@ -1190,38 +1454,65 @@ def main() -> None:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Stream build output to the terminal (or set SSM_INSTALL_VERBOSE=1).",
+    )
+    p.add_argument(
+        "--list-versions",
+        action="store_true",
+        help="Print registry versions for the channel and exit (no install).",
+    )
+    p.add_argument(
+        "--release",
+        dest="install_version",
+        metavar="VERSION",
+        help="Install this registry version instead of latest (full registry mode).",
+    )
     args = p.parse_args()
-    if args.write_cli_updates:
-        _write_cli_updates_from_args(args)
-        return
-    config_layout = _read_install_layout_from_config()
-    layout = "alternative" if args.alternative else config_layout
-    if args.shell:
-        shells = _normalize_completion_shells(args.shell)
-    else:
-        shells = _read_completion_shells_from_config()
-    if bool(args.zip) ^ bool(args.sha256):
-        _die("Both --zip and --sha256 are required together.")
-    if args.zip is not None:
-        if not args.zip.is_file():
-            _die(f"Zip not found: {args.zip}")
-        assert args.sha256 is not None
-        rv = (args.release_version or "").strip() or None
-        _install_from_zip(
-            args.zip,
-            args.sha256,
-            release_label=rv,
+
+    def _run() -> None:
+        if args.write_cli_updates:
+            _write_cli_updates_from_args(args)
+            return
+        config_layout = _read_install_layout_from_config()
+        layout = "alternative" if args.alternative else config_layout
+        if args.shell:
+            shells = _normalize_completion_shells(args.shell)
+        else:
+            shells = _read_completion_shells_from_config()
+        if bool(args.zip) ^ bool(args.sha256):
+            _die("Both --zip and --sha256 are required together.")
+        if args.zip is not None:
+            if not args.zip.is_file():
+                _die(f"Zip not found: {args.zip}")
+            assert args.sha256 is not None
+            rv = (args.release_version or "").strip() or None
+            _install_from_zip(
+                args.zip,
+                args.sha256,
+                release_label=rv,
+                install_layout=layout,
+                completion_shells=shells,
+                registry_channel=args.channel,
+            )
+            return
+        _full_registry_install(
+            channel_override=args.channel,
             install_layout=layout,
             completion_shells=shells,
-            registry_channel=args.channel,
+            install_version=args.install_version,
+            list_versions_only=args.list_versions,
         )
-        return
-    _full_registry_install(
-        channel_override=args.channel,
-        install_layout=layout,
-        completion_shells=shells,
-    )
 
-
-if __name__ == "__main__":
-    main()
+    try:
+        _run()
+    except (KeyboardInterrupt, _Interrupted) as exc:
+        phase = getattr(exc, "phase", "unknown")
+        if phase == "install":
+            state = "Install may be incomplete; re-run the installer."
+        else:
+            state = "Your previous install was not changed."
+        print(f"\nInstallation cancelled. {state}", file=sys.stderr, flush=True)
+        raise SystemExit(130) from exc
