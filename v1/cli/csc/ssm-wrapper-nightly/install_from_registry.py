@@ -70,6 +70,10 @@ _INSTALL_COMPLETION_SHELLS_ENV = "INSTALL_COMPLETION_SHELLS"
 
 # Same paths as Makefile ``completions-cleanup-internal`` (``prefix=/usr/local``).
 _INSTALL_TOTAL_STEPS = 6
+_INSTALL_STEP_COUNTER = 0
+
+# Set by ``ssm -up`` when invoking this script as a subprocess (non-interactive).
+_INSTALL_HELPER_SUBPROCESS_ENV = "SSM_INVOKE_INSTALL_HELPER"
 
 
 class _Interrupted(Exception):
@@ -94,9 +98,30 @@ def _install_verbose() -> bool:
     return "--verbose" in sys.argv
 
 
+def _reset_install_steps(*, total: int = 6) -> None:
+    """Start a fresh numbered step sequence (``[1/total]`` …)."""
+    global _INSTALL_STEP_COUNTER, _INSTALL_TOTAL_STEPS
+    _INSTALL_STEP_COUNTER = 0
+    _INSTALL_TOTAL_STEPS = total
+
+
+def _install_step(text: str) -> None:
+    """Print the next numbered install step to stderr."""
+    global _INSTALL_STEP_COUNTER
+    _INSTALL_STEP_COUNTER += 1
+    print(
+        f"[{_INSTALL_STEP_COUNTER}/{_INSTALL_TOTAL_STEPS}] {text}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _step(n: int, text: str) -> None:
-    """Print a numbered install step to stderr."""
-    print(f"[{n}/{_INSTALL_TOTAL_STEPS}] {text}", file=sys.stderr, flush=True)
+    """Legacy helper for tests; prefer :func:`_install_step`."""
+    global _INSTALL_STEP_COUNTER, _INSTALL_TOTAL_STEPS
+    _INSTALL_STEP_COUNTER = n - 1
+    _INSTALL_TOTAL_STEPS = max(_INSTALL_TOTAL_STEPS, n)
+    _install_step(text)
 
 
 def _note(text: str) -> None:
@@ -330,6 +355,8 @@ def _maybe_prompt_release_notes(bundle_root: Path, release_label: str) -> None:
     """
     if _changelog_skip_prompt():
         return
+    if os.environ.get(_INSTALL_HELPER_SUBPROCESS_ENV, "").strip() == "1":
+        return
     rel = release_label.strip()
     if not rel:
         return
@@ -368,21 +395,29 @@ def _maybe_prompt_release_notes(bundle_root: Path, release_label: str) -> None:
     ans = ""
     try:
         if read_fn is None:
-            print(prompt, end="", flush=True)
-            rlist, _, _ = select.select([sys.stdin], [], [], 20.0)
+            print(prompt, end="", flush=True, file=sys.stderr)
+            try:
+                rlist, _, _ = select.select([sys.stdin], [], [], 20.0)
+            except (ValueError, OSError):
+                print(file=sys.stderr)
+                return
             if rlist:
                 ans = sys.stdin.readline().strip().lower()
             else:
-                print()
+                print(file=sys.stderr)
                 return
         else:
-            print(prompt, end="", flush=True)
+            print(prompt, end="", flush=True, file=sys.stderr)
             fd = read_fn.fileno()
-            rlist, _, _ = select.select([fd], [], [], 20.0)
+            try:
+                rlist, _, _ = select.select([fd], [], [], 20.0)
+            except (ValueError, OSError):
+                print(file=sys.stderr)
+                return
             if rlist:
                 ans = read_fn.readline().strip().lower()
             else:
-                print()
+                print(file=sys.stderr)
                 return
     except (EOFError, KeyboardInterrupt):
         print()
@@ -1157,8 +1192,7 @@ def _run_build_and_install_internal(
         log_f = open(log_path, "w", encoding="utf-8")
 
     _INSTALL_PHASE = "build"
-    _step(
-        4,
+    _install_step(
         "Building ssm-wrapper (venv, dependencies, PyInstaller) — usually 2–5 minutes",
     )
     build_ok = False
@@ -1191,7 +1225,7 @@ def _run_build_and_install_internal(
             except OSError:
                 pass
 
-    _step(5, "Preparing privileged install (sudo)")
+    _install_step("Preparing privileged install (sudo)")
     if os.geteuid() != 0:
         _note("Administrator password needed to write /usr/local (sudo)")
         _run_with_optional_tty(
@@ -1202,7 +1236,7 @@ def _run_build_and_install_internal(
         )
 
     _INSTALL_PHASE = "install"
-    _step(6, "Installing under /usr/local (replacing prior ssm-wrapper files)")
+    _install_step("Installing under /usr/local (replacing prior ssm-wrapper files)")
     _sudo_local_cleanup()
     try:
         rc = _run_make_install_internal_returncode(
@@ -1230,15 +1264,19 @@ def _install_from_zip(
     registry_channel: Optional[str] = None,
     pinned_version: Optional[str] = None,
     clear_pinned: bool = False,
+    bundle_checksum_verified: bool = False,
 ) -> None:
     tmp_root = Path(tempfile.mkdtemp(prefix="ssm-wrapper-extract-"))
     try:
-        _step(1, "Reading and verifying bundle checksum")
+        if _INSTALL_STEP_COUNTER == 0:
+            _reset_install_steps(total=5 if not bundle_checksum_verified else 6)
         data = zip_path.read_bytes()
-        digest = hashlib.sha256(data).hexdigest()
-        if digest != expected_sha256.strip().lower():
-            _die("Bundle checksum does not match expected value (possible tampering).")
-        _step(2, "Extracting bundle")
+        if not bundle_checksum_verified:
+            _install_step("Reading and verifying bundle checksum")
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != expected_sha256.strip().lower():
+                _die("Bundle checksum does not match expected value (possible tampering).")
+        _install_step("Extracting bundle")
         zcopy = tmp_root / "bundle.zip"
         zcopy.write_bytes(data)
         with zipfile.ZipFile(zcopy) as zf:
@@ -1321,7 +1359,8 @@ def _full_registry_install(
         )
     channel = _resolve_install_channel(channel_override)
     base = _registry_base(channel)
-    _step(1, f"Fetching version list from registry ({channel})")
+    _reset_install_steps(total=6)
+    _install_step(f"Fetching version list from registry ({channel})")
     try:
         doc = json.loads(_http_get(f"{base}/versions").decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -1342,7 +1381,7 @@ def _full_registry_install(
             f"{f'--channel {channel} ' if channel_override else ''}".strip(),
         )
 
-    _step(2, f"Downloading bundle {target}")
+    _install_step(f"Downloading bundle {target}")
     try:
         dl = _fetch_download_meta(base, target)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -1377,6 +1416,7 @@ def _full_registry_install(
             registry_channel=channel,
             pinned_version=pin,
             clear_pinned=clear_pin,
+            bundle_checksum_verified=True,
         )
     finally:
         try:
