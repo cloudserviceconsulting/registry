@@ -53,6 +53,15 @@
           "arch": "universal"
         }
       ]
+    },
+    {
+      "version": "4.13.3",
+      "platforms": [
+        {
+          "os": "universal",
+          "arch": "universal"
+        }
+      ]
     }
   ]
 }
