@@ -8,7 +8,7 @@
   "download_url": "https://github.com/cloudserviceconsulting/registry/releases/download/v0.6.1/terraform-provider-jira_0.6.1_darwin_arm64.zip",
   "shasums_url": "https://github.com/cloudserviceconsulting/registry/releases/download/v0.6.1/terraform-provider-jira_0.6.1_SHA256SUMS",
   "shasums_signature_url": "https://github.com/cloudserviceconsulting/registry/releases/download/v0.6.1/terraform-provider-jira_0.6.1_SHA256SUMS.sig",
-  "shasum": "5a286f153863520ea697a911956da53a92fd4174bc5f5ad982a76fc1fd8a982f",
+  "shasum": "feb888c069ef838b6dae2fd3b8ab4a2ae6065ec83e80adc3dcb8a3e42464fd23",
   "signing_keys": {
     "gpg_public_keys": [
       {
